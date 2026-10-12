@@ -1,4 +1,5 @@
 import argparse
+import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -6,37 +7,100 @@ from model import SimpleCNN
 from dataset import get_transforms
 
 
-def preprocess_image(image_path: str) -> torch.Tensor:
+def preprocess_image(image_input) -> torch.Tensor:
     """Load and preprocess a digit image for MNIST model inference.
 
-    Steps:
-    1. Open image and convert to grayscale (L mode)
-    2. Auto-invert if background is light (mean brightness > 127)
-    3. Resize to 28x28 pixels
-    4. Convert to tensor and normalize with MNIST statistics
+    Optimized for real-world photos, scans, and drawings:
+    1. Loads image and converts to grayscale (L mode)
+    2. Detects background via border sampling & auto-inverts (paper vs dark canvas)
+    3. Suppresses background noise and normalizes dynamic range
+    4. Extracts bounding box of the handwritten digit
+    5. Resizes to fit a 20x20 box preserving original aspect ratio
+    6. Centers the digit in a 28x28 canvas using Center of Mass (MNIST specification)
+    7. Applies standard MNIST normalization
     """
-    # Step 1: Load image in grayscale
-    img = Image.open(image_path).convert("L")
+    if isinstance(image_input, str):
+        img = Image.open(image_input).convert("L")
+    elif isinstance(image_input, Image.Image):
+        img = image_input.convert("L")
+    else:
+        raise TypeError("image_input must be a file path string or PIL Image")
 
-    # Step 2: Auto-inversion detection
-    # MNIST has black digits on white background (0=black, 255=white)
-    # If input image has light background (mean > 127), invert to match
-    pixels = list(img.getdata())
-    mean_brightness = sum(pixels) / len(pixels)
+    arr = np.array(img, dtype=np.float32)
 
-    if mean_brightness > 127:
-        # Invert pixel values: 255 - pixel_value for each pixel
-        inverted_pixels = [255 - p for p in pixels]
-        # Create new image from inverted pixel data
-        # PIL Image.frombytes expects raw bytes; use frombuffer with proper shape
-        img = Image.frombytes("L", img.size, bytes(inverted_pixels))
+    # Step 1: Detect background tone using image border pixels
+    h, w = arr.shape
+    if h > 2 and w > 2:
+        border_pixels = np.concatenate([arr[0, :], arr[-1, :], arr[:, 0], arr[:, -1]])
+        bg_brightness = float(np.median(border_pixels))
+    else:
+        bg_brightness = float(np.mean(arr))
 
-    # Step 3: Resize to 28x28 pixels
-    img = img.resize((28, 28), Image.BILINEAR)
+    # Real-world paper images have light background and dark ink -> invert
+    if bg_brightness > 127:
+        arr = 255.0 - arr
 
-    # Step 4: Apply transforms (ToTensor + Normalize)
-    _, val_transform = get_transforms()
-    tensor = val_transform(img)
+    # Step 2: Suppress background noise and stretch contrast
+    threshold = max(25.0, float(np.percentile(arr, 60)))
+    arr = np.where(arr > threshold * 0.7, arr, 0.0)
+    max_val = float(arr.max())
+    if max_val > 0:
+        arr = (arr / max_val) * 255.0
+
+    # Step 3: Find bounding box of foreground digit
+    row_sums = np.sum(arr, axis=1)
+    col_sums = np.sum(arr, axis=0)
+    rows = np.where(row_sums > 0)[0]
+    cols = np.where(col_sums > 0)[0]
+
+    if len(rows) == 0 or len(cols) == 0:
+        canvas = np.zeros((28, 28), dtype=np.uint8)
+    else:
+        r_min, r_max = int(rows[0]), int(rows[-1])
+        c_min, c_max = int(cols[0]), int(cols[-1])
+        crop = arr[r_min:r_max + 1, c_min:c_max + 1]
+        crop_h, crop_w = crop.shape
+
+        crop_img = Image.fromarray(crop.astype(np.uint8))
+
+        # Step 4: Aspect-ratio preserving resize into 20x20 box
+        if crop_h > crop_w:
+            new_h = 20
+            new_w = max(1, int(round(crop_w * 20.0 / crop_h)))
+        else:
+            new_w = 20
+            new_h = max(1, int(round(crop_h * 20.0 / crop_w)))
+
+        crop_resized = crop_img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+        resized_arr = np.array(crop_resized, dtype=np.float32)
+
+        # Step 5: Center-of-mass centering in 28x28 canvas
+        canvas = np.zeros((28, 28), dtype=np.float32)
+        start_y = (28 - new_h) // 2
+        start_x = (28 - new_w) // 2
+        canvas[start_y:start_y + new_h, start_x:start_x + new_w] = resized_arr
+
+        total_mass = float(np.sum(canvas))
+        if total_mass > 1e-4:
+            cy = float(np.sum(np.arange(28)[:, None] * canvas)) / total_mass
+            cx = float(np.sum(np.arange(28)[None, :] * canvas)) / total_mass
+            shift_y = int(round(14.0 - cy))
+            shift_x = int(round(14.0 - cx))
+
+            shifted = np.zeros_like(canvas)
+            for y in range(28):
+                for x in range(28):
+                    src_y = y - shift_y
+                    src_x = x - shift_x
+                    if 0 <= src_y < 28 and 0 <= src_x < 28:
+                        shifted[y, x] = canvas[src_y, src_x]
+            canvas = shifted
+
+        canvas = canvas.astype(np.uint8)
+
+    # Step 6: Apply transforms (ToTensor + Normalize)
+    _, val_transform = get_transforms(augment=False)
+    tensor = val_transform(Image.fromarray(canvas))
 
     # Add batch dimension: shape becomes [1, 1, 28, 28]
     tensor = tensor.unsqueeze(0)

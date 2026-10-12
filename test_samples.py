@@ -138,7 +138,7 @@ def main():
     if wrong:
         print("\nMisclassified samples (marked WRONG):")
         for r in wrong:
-            print(f"  ✗ {r['filename']}: true={r['true_digit']}, "
+            print(f"  [X] {r['filename']}: true={r['true_digit']}, "
                   f"predicted={r['predicted_digit']}, confidence={r['confidence']:.2f}%")
     else:
         print("\nAll samples classified correctly.")

@@ -1,6 +1,6 @@
 # Icarus: MNIST Digit Recognition
 
-A simple and basic Convolutional Neural Network (CNN) to recognize handwritten digits (0-9) from the MNIST dataset.
+A simple and robust Convolutional Neural Network (CNN) to recognize handwritten digits (0-9) from the MNIST dataset, optimized for real-world handwriting.
 
 ## Project Structure
 
@@ -39,11 +39,11 @@ pip install -r requirements.txt
 ```bash
 python train.py
 # Or customize epochs and batch size:
-python train.py --epochs 5 --batch-size 64
+python train.py --epochs 10 --batch-size 64
 ```
 
-- Trains for 5 epochs (default) using the MNIST dataset
-- Achieves ~99%+ validation accuracy
+- Trains for 10 epochs (default) using the MNIST dataset with data augmentation
+- Achieves ~99.6% validation accuracy
 - Saves model checkpoint to `mnist_cnn.pth`
 
 ### 3. Run Prediction on an Image
@@ -66,16 +66,18 @@ pytest tests/test_model.py
 
 The `SimpleCNN` model in `model.py` consists of:
 
-- **Conv2d Block 1**: 1 input channel → 32 filters, kernel 3x3, ReLU, MaxPool2d → output: [B, 32, 14, 14]
-- **Conv2d Block 2**: 32 channels → 64 filters, kernel 3x3, ReLU, MaxPool2d → output: [B, 64, 7, 7]
-- **Dropout**: Rate 0.25 after pooling, Rate 0.5 before final dense layer
-- **Fully Connected**: 64 × 7 × 7 = 3136 inputs → 128 hidden → 10 output logits (digits 0-9)
+- **Conv2d Block 1**: 2× (Conv 3x3, BatchNorm2d, ReLU), MaxPool2d, Dropout2d (0.25) → output: [B, 32, 14, 14]
+- **Conv2d Block 2**: 2× (Conv 3x3, BatchNorm2d, ReLU), MaxPool2d, Dropout2d (0.25) → output: [B, 64, 7, 7]
+- **Conv2d Block 3**: Conv 3x3, BatchNorm2d, ReLU, MaxPool2d, Dropout2d (0.25) → output: [B, 128, 3, 3]
+- **Fully Connected**: 128 × 3 × 3 = 1152 inputs → 128 (BatchNorm1d, ReLU, Dropout 0.4) → 10 output logits (digits 0-9)
 
 ## Training Details
 
-- **Optimizer**: Adam with learning rate 0.001
+- **Optimizer**: AdamW with learning rate 0.002 and weight decay 1e-4
+- **Scheduler**: CosineAnnealingLR
+- **Data Augmentation**: RandomAffine (rotation ±15°, translation ±10%, scale 0.9-1.1x, shear 10°)
 - **Loss Function**: CrossEntropyLoss
-- **Epochs**: 5 (sufficient to reach >98.5% accuracy quickly)
+- **Epochs**: 10 (configurable via `--epochs`)
 - **Batch Size**: 64 (configurable via `--batch-size`)
 - **Device**: Auto-detects CUDA GPU > Apple MPS > CPU
 
@@ -84,10 +86,11 @@ The `SimpleCNN` model in `model.py` consists of:
 The `predict.py` script accepts an image path and performs:
 
 1. **Grayscale conversion**: Image converted to L (grayscale) mode
-2. **Auto-inversion**: If image mean brightness > 127, colors are inverted to match MNIST convention (black digit on white background)
-3. **Resize**: Resized to 28×28 pixels using bilinear interpolation
-4. **Normalization**: Normalized using MNIST statistics (mean=0.1307, std=0.3081)
-5. **Inference**: Forward pass through SimpleCNN with Softmax to get class probabilities
+2. **Auto-inversion & noise filtering**: Background tone detected from borders; inverts light paper and removes low-level noise
+3. **Bounding-box isolation**: Isolates digit strokes and removes empty page borders
+4. **Centering & resize**: Digit aspect ratio preserved within 20×20 box and centered on 28×28 canvas by center of mass
+5. **Normalization**: Normalized using MNIST statistics (mean=0.1307, std=0.3081)
+6. **Inference**: Forward pass through SimpleCNN with Softmax to get class probabilities
 
 Output format:
 ```

@@ -42,20 +42,25 @@ class TestPreprocessing:
         assert tensor.shape == torch.Size([1, 28, 28])
 
     def test_inversion_logic_dark_background(self):
-        """Test that images with dark backgrounds are not inverted."""
-        # Create all-black image (dark background = should not invert)
+        """Test that images with dark backgrounds are detected correctly."""
+        # Create all-black image (dark background)
         img = Image.new("L", (28, 28), 0)
-        pixels = list(img.getdata())
-        mean_brightness = sum(pixels) / len(pixels)
+        mean_brightness = float(np.array(img).mean())
         assert mean_brightness <= 127, "All-black image should have mean <= 127"
 
     def test_inversion_logic_light_background(self):
-        """Test that images with light backgrounds are inverted."""
-        # Create all-white image (light background = should invert)
+        """Test that images with light backgrounds are detected correctly."""
+        # Create all-white image (light background)
         img = Image.new("L", (28, 28), 255)
-        pixels = list(img.getdata())
-        mean_brightness = sum(pixels) / len(pixels)
+        mean_brightness = float(np.array(img).mean())
         assert mean_brightness > 127, "All-white image should have mean > 127"
+
+    def test_preprocess_image_pil_input(self):
+        """Test that preprocess_image correctly handles PIL Image and outputs (1, 1, 28, 28)."""
+        img = Image.new("RGB", (120, 150), (255, 255, 255))
+        tensor = preprocess_image(img)
+        assert isinstance(tensor, torch.Tensor)
+        assert tensor.shape == torch.Size([1, 1, 28, 28])
 
 
 class TestEndToEnd:

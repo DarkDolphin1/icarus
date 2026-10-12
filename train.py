@@ -1,9 +1,9 @@
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from model import SimpleCNN
 from dataset import get_train_loader, get_val_loader
-import argparse
 
 
 def train_one_epoch(model, loader, optimizer, criterion, device):
@@ -51,10 +51,12 @@ def validate(model, loader, criterion, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train SimpleCNN on MNIST")
-    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
+    parser = argparse.ArgumentParser(description="Train SimpleCNN on MNIST with Real-World Robustness")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=64, help="Input batch size for training")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=2e-3, help="Learning rate")
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay regularization")
+    parser.add_argument("--no-augment", action="store_true", help="Disable training data augmentation")
     parser.add_argument("--checkpoint", type=str, default="mnist_cnn.pth", help="Path to save model checkpoint")
     args = parser.parse_args()
 
@@ -68,29 +70,38 @@ def main():
 
     print(f"Using device: {device}")
 
-    # Initialize model, loss function, and optimizer
+    # Initialize model, loss function, optimizer, and scheduler
     model = SimpleCNN().to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # Prepare data loaders
-    train_loader = get_train_loader(batch_size=args.batch_size)
+    # Prepare data loaders (with real-world data augmentation enabled by default)
+    train_loader = get_train_loader(batch_size=args.batch_size, augment=(not args.no_augment))
     val_loader = get_val_loader(batch_size=args.batch_size)
+
+    best_val_accuracy = 0.0
 
     # Training loop across specified epochs
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
         val_loss, val_accuracy = validate(model, val_loader, criterion, device)
+        scheduler.step()
 
+        current_lr = scheduler.get_last_lr()[0]
         print(
             f"Epoch {epoch:02d}/{args.epochs}: "
             f"Train Loss: {train_loss:.4f}, "
             f"Val Loss: {val_loss:.4f}, "
-            f"Val Acc: {val_accuracy:.2f}%"
+            f"Val Acc: {val_accuracy:.2f}% "
+            f"(LR: {current_lr:.6f})"
         )
 
-    # Save trained model checkpoint
-    torch.save(model.state_dict(), args.checkpoint)
+        if val_accuracy > best_val_accuracy:
+            best_val_accuracy = val_accuracy
+            torch.save(model.state_dict(), args.checkpoint)
+
+    print(f"Best Validation Accuracy: {best_val_accuracy:.2f}%")
     print(f"Model checkpoint saved to {args.checkpoint}")
 
 

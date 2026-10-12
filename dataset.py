@@ -7,12 +7,29 @@ from torchvision import datasets, transforms
 DATA_DIR = "data"
 
 
-def get_transforms():
-    """Returns train and validation transform pipelines for MNIST."""
-    train_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
-    ])
+def get_transforms(augment: bool = True):
+    """Returns train and validation transform pipelines for MNIST.
+
+    Args:
+        augment: If True, applies random affine distortions (rotation, translation,
+                 scale, shear) to mimic real-world handwriting variability.
+    """
+    if augment:
+        train_transform = transforms.Compose([
+            transforms.RandomAffine(
+                degrees=15,
+                translate=(0.1, 0.1),
+                scale=(0.9, 1.1),
+                shear=10
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,))
+        ])
+    else:
+        train_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,))
+        ])
 
     val_transform = transforms.Compose([
         transforms.ToTensor(),
@@ -22,9 +39,9 @@ def get_transforms():
     return train_transform, val_transform
 
 
-def get_train_loader(batch_size: int = 64, shuffle: bool = True, **kwargs):
+def get_train_loader(batch_size: int = 64, shuffle: bool = True, augment: bool = True, **kwargs):
     """Constructs and returns a DataLoader for the training MNIST partition."""
-    train_transform, _ = get_transforms()
+    train_transform, _ = get_transforms(augment=augment)
     dataset = datasets.MNIST(
         root=DATA_DIR,
         train=True,
