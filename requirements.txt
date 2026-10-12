@@ -4,3 +4,4 @@ torch==2.14.0+cu126
 torchvision==0.29.0+cu126
 pillow
 pytest
+scipy

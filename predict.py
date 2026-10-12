@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from scipy.ndimage import gaussian_filter, label
 from model import SimpleCNN
 from dataset import get_transforms
 
@@ -10,14 +11,16 @@ from dataset import get_transforms
 def preprocess_image(image_input) -> torch.Tensor:
     """Load and preprocess a digit image for MNIST model inference.
 
-    Optimized for real-world photos, scans, and drawings:
-    1. Loads image and converts to grayscale (L mode)
-    2. Detects background via border sampling & auto-inverts (paper vs dark canvas)
-    3. Suppresses background noise and normalizes dynamic range
-    4. Extracts bounding box of the handwritten digit
-    5. Resizes to fit a 20x20 box preserving original aspect ratio
-    6. Centers the digit in a 28x28 canvas using Center of Mass (MNIST specification)
-    7. Applies standard MNIST normalization
+    Handles both standard cropped samples and uncropped high-resolution
+    phone/webcam photographs with room shadows and illumination gradients:
+    1. Converts image to grayscale.
+    2. For camera photos / full pages (>300px), removes lighting gradients via
+       local background subtraction and isolates the primary digit stroke using
+       connected-component analysis.
+    3. For cropped digits, applies robust border-sampled inversion and contrast stretching.
+    4. Resizes to fit within a 20x20 box preserving original aspect ratio.
+    5. Centers the digit on a 28x28 canvas using Center of Mass (MNIST specification).
+    6. Applies standard MNIST normalization.
     """
     if isinstance(image_input, str):
         img = Image.open(image_input).convert("L")
@@ -26,83 +29,138 @@ def preprocess_image(image_input) -> torch.Tensor:
     else:
         raise TypeError("image_input must be a file path string or PIL Image")
 
-    arr = np.array(img, dtype=np.float32)
+    w, h = img.size
 
-    # Step 1: Detect background tone using image border pixels
-    h, w = arr.shape
-    if h > 2 and w > 2:
-        border_pixels = np.concatenate([arr[0, :], arr[-1, :], arr[:, 0], arr[:, -1]])
-        bg_brightness = float(np.median(border_pixels))
-    else:
-        bg_brightness = float(np.mean(arr))
+    # Check if this is an uncropped camera photograph or high-res scan
+    is_camera_photo = (w > 300 or h > 300)
 
-    # Real-world paper images have light background and dark ink -> invert
-    if bg_brightness > 127:
-        arr = 255.0 - arr
+    if is_camera_photo:
+        # Downscale for fast, robust illumination analysis
+        img_scaled = img.copy()
+        img_scaled.thumbnail((800, 800), Image.Resampling.LANCZOS)
+        arr = np.array(img_scaled, dtype=np.float32)
 
-    # Step 2: Suppress background noise and stretch contrast
-    threshold = max(25.0, float(np.percentile(arr, 60)))
-    arr = np.where(arr > threshold * 0.7, arr, 0.0)
-    max_val = float(arr.max())
-    if max_val > 0:
-        arr = (arr / max_val) * 255.0
+        # Local background estimation to remove room shadows / lighting gradients
+        bg = gaussian_filter(arr, sigma=20)
+        diff_dark = np.maximum(bg - arr, 0.0)   # dark ink on lighter paper
+        diff_light = np.maximum(arr - bg, 0.0)  # light stroke on dark background
+        diff = diff_dark if np.percentile(diff_dark, 99.5) >= np.percentile(diff_light, 99.5) else diff_light
 
-    # Step 3: Find bounding box of foreground digit
-    row_sums = np.sum(arr, axis=1)
-    col_sums = np.sum(arr, axis=0)
-    rows = np.where(row_sums > 0)[0]
-    cols = np.where(col_sums > 0)[0]
+        # Dynamic threshold for ink stroke
+        p99 = np.percentile(diff, 99.8)
+        thresh = max(10.0, p99 * 0.40)
+        binary = diff > thresh
 
-    if len(rows) == 0 or len(cols) == 0:
-        canvas = np.zeros((28, 28), dtype=np.uint8)
-    else:
-        r_min, r_max = int(rows[0]), int(rows[-1])
-        c_min, c_max = int(cols[0]), int(cols[-1])
-        crop = arr[r_min:r_max + 1, c_min:c_max + 1]
-        crop_h, crop_w = crop.shape
+        # Ignore 3% border to discard photo frame / desk edge artifacts
+        sh, sw = binary.shape
+        by, bx = max(1, int(sh * 0.03)), max(1, int(sw * 0.03))
+        binary[:by, :] = 0
+        binary[-by:, :] = 0
+        binary[:, :bx] = 0
+        binary[:, -bx:] = 0
 
-        crop_img = Image.fromarray(crop.astype(np.uint8))
-
-        # Step 4: Aspect-ratio preserving resize into 20x20 box
-        if crop_h > crop_w:
-            new_h = 20
-            new_w = max(1, int(round(crop_w * 20.0 / crop_h)))
+        # Connected component analysis to isolate main digit stroke
+        lbl, num = label(binary)
+        if num == 0:
+            canvas = np.zeros((28, 28), dtype=np.uint8)
         else:
-            new_w = 20
-            new_h = max(1, int(round(crop_h * 20.0 / crop_w)))
+            sizes = [(i, np.count_nonzero(lbl == i)) for i in range(1, num + 1)]
+            sizes.sort(key=lambda x: x[1], reverse=True)
+            mask = (lbl == sizes[0][0])
+            r = np.where(np.sum(mask, axis=1) > 0)[0]
+            c = np.where(np.sum(mask, axis=0) > 0)[0]
 
-        crop_resized = crop_img.resize((new_w, new_h), Image.Resampling.BILINEAR)
-        resized_arr = np.array(crop_resized, dtype=np.float32)
+            crop = (diff * mask)[r[0]:r[-1] + 1, c[0]:c[-1] + 1]
+            c_norm = (crop / max(1e-5, crop.max())) * 255.0
 
-        # Step 5: Center-of-mass centering in 28x28 canvas
-        canvas = np.zeros((28, 28), dtype=np.float32)
-        start_y = (28 - new_h) // 2
-        start_x = (28 - new_w) // 2
-        canvas[start_y:start_y + new_h, start_x:start_x + new_w] = resized_arr
+            dh, dw = c_norm.shape
+            c_pil = Image.fromarray(c_norm.astype(np.uint8))
+            if dh > dw:
+                nh = 20
+                nw = max(1, int(round(dw * 20.0 / dh)))
+            else:
+                nw = 20
+                nh = max(1, int(round(dh * 20.0 / dw)))
+            resized = np.array(c_pil.resize((nw, nh), Image.Resampling.BILINEAR), dtype=np.float32)
 
-        total_mass = float(np.sum(canvas))
-        if total_mass > 1e-4:
-            cy = float(np.sum(np.arange(28)[:, None] * canvas)) / total_mass
-            cx = float(np.sum(np.arange(28)[None, :] * canvas)) / total_mass
-            shift_y = int(round(14.0 - cy))
-            shift_x = int(round(14.0 - cx))
+            canvas = np.zeros((28, 28), dtype=np.float32)
+            canvas[(28 - nh) // 2:(28 - nh) // 2 + nh, (28 - nw) // 2:(28 - nw) // 2 + nw] = resized
 
-            shifted = np.zeros_like(canvas)
-            for y in range(28):
-                for x in range(28):
-                    src_y = y - shift_y
-                    src_x = x - shift_x
-                    if 0 <= src_y < 28 and 0 <= src_x < 28:
-                        shifted[y, x] = canvas[src_y, src_x]
-            canvas = shifted
+            total_m = canvas.sum()
+            if total_m > 0:
+                cy = np.sum(np.arange(28)[:, None] * canvas) / total_m
+                cx = np.sum(np.arange(28)[None, :] * canvas) / total_m
+                sh_y, sh_x = int(round(14.0 - cy)), int(round(14.0 - cx))
+                shifted = np.zeros_like(canvas)
+                for y in range(28):
+                    for x in range(28):
+                        sy, sx = y - sh_y, x - sh_x
+                        if 0 <= sy < 28 and 0 <= sx < 28:
+                            shifted[y, x] = canvas[sy, sx]
+                canvas = shifted.astype(np.uint8)
+            else:
+                canvas = canvas.astype(np.uint8)
+    else:
+        # Standard cropped sample or benchmark digit
+        arr = np.array(img, dtype=np.float32)
+        h_arr, w_arr = arr.shape
+        if h_arr > 2 and w_arr > 2:
+            border = np.concatenate([arr[0, :], arr[-1, :], arr[:, 0], arr[:, -1]])
+            bg_brightness = float(np.median(border))
+        else:
+            bg_brightness = float(np.mean(arr))
 
-        canvas = canvas.astype(np.uint8)
+        if bg_brightness > 127:
+            arr = 255.0 - arr
 
-    # Step 6: Apply transforms (ToTensor + Normalize)
+        threshold = max(25.0, float(np.percentile(arr, 60)))
+        arr = np.where(arr > threshold * 0.7, arr, 0.0)
+        max_val = float(arr.max())
+        if max_val > 0:
+            arr = (arr / max_val) * 255.0
+
+        rows = np.where(np.sum(arr, axis=1) > 0)[0]
+        cols = np.where(np.sum(arr, axis=0) > 0)[0]
+
+        if len(rows) == 0 or len(cols) == 0:
+            canvas = np.zeros((28, 28), dtype=np.uint8)
+        else:
+            r_min, r_max = int(rows[0]), int(rows[-1])
+            c_min, c_max = int(cols[0]), int(cols[-1])
+            crop = arr[r_min:r_max + 1, c_min:c_max + 1]
+            crop_h, crop_w = crop.shape
+
+            crop_img = Image.fromarray(crop.astype(np.uint8))
+            if crop_h > crop_w:
+                new_h = 20
+                new_w = max(1, int(round(crop_w * 20.0 / crop_h)))
+            else:
+                new_w = 20
+                new_h = max(1, int(round(crop_h * 20.0 / crop_w)))
+
+            crop_resized = crop_img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+            resized_arr = np.array(crop_resized, dtype=np.float32)
+
+            canvas = np.zeros((28, 28), dtype=np.float32)
+            canvas[(28 - new_h) // 2:(28 - new_h) // 2 + new_h, (28 - new_w) // 2:(28 - new_w) // 2 + new_w] = resized_arr
+
+            total_mass = float(np.sum(canvas))
+            if total_mass > 1e-4:
+                cy = float(np.sum(np.arange(28)[:, None] * canvas)) / total_mass
+                cx = float(np.sum(np.arange(28)[None, :] * canvas)) / total_mass
+                shift_y, shift_x = int(round(14.0 - cy)), int(round(14.0 - cx))
+                shifted = np.zeros_like(canvas)
+                for y in range(28):
+                    for x in range(28):
+                        src_y, src_x = y - shift_y, x - shift_x
+                        if 0 <= src_y < 28 and 0 <= src_x < 28:
+                            shifted[y, x] = canvas[src_y, src_x]
+                canvas = shifted.astype(np.uint8)
+            else:
+                canvas = canvas.astype(np.uint8)
+
     _, val_transform = get_transforms(augment=False)
     tensor = val_transform(Image.fromarray(canvas))
-
-    # Add batch dimension: shape becomes [1, 1, 28, 28]
     tensor = tensor.unsqueeze(0)
     return tensor
 
