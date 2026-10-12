@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from scipy.ndimage import gaussian_filter, label
+from scipy.ndimage import gaussian_filter, label, binary_dilation
 from model import SimpleCNN
 from dataset import get_transforms
 
@@ -14,9 +14,10 @@ def preprocess_image(image_input) -> torch.Tensor:
     Handles both standard cropped samples and uncropped high-resolution
     phone/webcam photographs with room shadows and illumination gradients:
     1. Converts image to grayscale.
-    2. For camera photos / full pages (>300px), removes lighting gradients via
-       local background subtraction and isolates the primary digit stroke using
-       connected-component analysis.
+    2. For camera photos / full pages (>200px), removes lighting gradients via
+       local background subtraction, detects ink polarity robustly, and groups
+       adjacent digit strokes (e.g. European 1 with beak & base, 4, 5, etc.) using
+       morphological dilation and connected-component analysis.
     3. For cropped digits, applies robust border-sampled inversion and contrast stretching.
     4. Resizes to fit within a 20x20 box preserving original aspect ratio.
     5. Centers the digit on a 28x28 canvas using Center of Mass (MNIST specification).
@@ -32,7 +33,7 @@ def preprocess_image(image_input) -> torch.Tensor:
     w, h = img.size
 
     # Check if this is an uncropped camera photograph or high-res scan
-    is_camera_photo = (w > 300 or h > 300)
+    is_camera_photo = (w > 200 or h > 200)
 
     if is_camera_photo:
         # Downscale for fast, robust illumination analysis
@@ -41,36 +42,39 @@ def preprocess_image(image_input) -> torch.Tensor:
         arr = np.array(img_scaled, dtype=np.float32)
 
         # Local background estimation to remove room shadows / lighting gradients
-        bg = gaussian_filter(arr, sigma=20)
+        bg = gaussian_filter(arr, sigma=25)
         diff_dark = np.maximum(bg - arr, 0.0)   # dark ink on lighter paper
         diff_light = np.maximum(arr - bg, 0.0)  # light stroke on dark background
-        diff = diff_dark if np.percentile(diff_dark, 99.5) >= np.percentile(diff_light, 99.5) else diff_light
+        diff = diff_dark if np.percentile(diff_dark, 99.9) >= np.percentile(diff_light, 99.9) else diff_light
 
         # Dynamic threshold for ink stroke
         p99 = np.percentile(diff, 99.8)
-        thresh = max(10.0, p99 * 0.40)
-        binary = diff > thresh
+        t_ink = max(4.0, p99 * 0.20)
+        ink_binary = diff > t_ink
 
         # Ignore 3% border to discard photo frame / desk edge artifacts
-        sh, sw = binary.shape
+        sh, sw = ink_binary.shape
         by, bx = max(1, int(sh * 0.03)), max(1, int(sw * 0.03))
-        binary[:by, :] = 0
-        binary[-by:, :] = 0
-        binary[:, :bx] = 0
-        binary[:, -bx:] = 0
+        ink_binary[:by, :] = False
+        ink_binary[-by:, :] = False
+        ink_binary[:, :bx] = False
+        ink_binary[:, -bx:] = False
 
-        # Connected component analysis to isolate main digit stroke
-        lbl, num = label(binary)
+        # Group adjacent/nearby strokes of the same digit (e.g. European 1 with beak & base, 4, 5, etc.)
+        struct = np.ones((11, 11), dtype=bool)
+        grouped = binary_dilation(ink_binary, structure=struct)
+        lbl, num = label(grouped)
         if num == 0:
             canvas = np.zeros((28, 28), dtype=np.uint8)
         else:
             sizes = [(i, np.count_nonzero(lbl == i)) for i in range(1, num + 1)]
             sizes.sort(key=lambda x: x[1], reverse=True)
-            mask = (lbl == sizes[0][0])
-            r = np.where(np.sum(mask, axis=1) > 0)[0]
-            c = np.where(np.sum(mask, axis=0) > 0)[0]
+            best_id = sizes[0][0]
+            char_mask = ink_binary & (lbl == best_id)
+            r = np.where(np.sum(char_mask, axis=1) > 0)[0]
+            c = np.where(np.sum(char_mask, axis=0) > 0)[0]
 
-            crop = (diff * mask)[r[0]:r[-1] + 1, c[0]:c[-1] + 1]
+            crop = (diff * char_mask)[r[0]:r[-1] + 1, c[0]:c[-1] + 1]
             c_norm = (crop / max(1e-5, crop.max())) * 255.0
 
             dh, dw = c_norm.shape
